@@ -1,0 +1,279 @@
+# Two-Stage Persuasion Technique Span Detection
+
+## Overview
+
+This repository implements a two-stage pipeline for character-level persuasion technique span localization across English, Polish, and Russian.
+
+**Stage 1** classifies paragraphs and predicts which of 23 persuasion techniques they contain.  
+**Stage 2** receives propaganda-positive paragraphs from Stage 1 and localizes exact character-level spans.
+
+```
+Article text
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│  Stage 1: Paragraph-level multi-label classification │
+│  Methods: Sup-FT  │  Prompt-A  │  Iter-Ens          │
+└──────────────────────────────┬──────────────────────┘
+                               │ positive paragraphs + technique labels
+                               ▼
+┌─────────────────────────────────────────────────────┐
+│  Stage 2: Character-level span localization          │
+│  Methods: S2-C (mBERT BIO)  │  S2-A / S2-B (LLM)   │
+└──────────────────────────────┬──────────────────────┘
+                               │
+                               ▼
+              Character-level span predictions
+```
+
+---
+
+## Repository Structure
+
+```
+.
+├── stage1/
+│   ├── stage1_step1_train_supft.ipynb        # Train Sup-FT (XLM-RoBERTa dual-encoder)
+│   ├── stage1_step2_eval_supft.ipynb         # Evaluate Sup-FT → paragraph-level Macro F1
+│   ├── stage1_step3_sr_para_compute.ipynb    # Compute SR_para (hard upper bound on span recall)
+│   ├── stage1_step4_nli_baseline.ipynb       # NLI zero-shot baseline (mDeBERTa-v3)
+│   ├── stage1_step5_prompta_iterens.ipynb    # Prompt-A and Iter-Ens (AutoGen, GPT-4o-mini)
+│   └── stage1_step6_confusion_tcm.ipynb      # Bi-normalized transport confusion matrix (TCM)
+│
+├── stage2/
+│   ├── stage2_step1_data_exploration.ipynb   # CheckThat! 2024 span data exploration & BIO conversion
+│   ├── stage2_step2_train_s2c.ipynb          # Train S2-C: mBERT L10 BIO token classifier
+│   ├── stage2_step3_crosseval.ipynb          # Stage 1 × Stage 2 cross-evaluation (Table V in paper)
+│   └── stage2_step4_error_decoupling.ipynb   # Six-way FP/FN error decoupling analysis (Table VII)
+│
+├── evaluation/
+│   └── evaluation_span_f1_scorer.ipynb       # Span F1 scorer (IoU > 0 overlap matching)
+│
+└── README.md
+
+```
+
+---
+
+## Methods
+
+### Stage 1
+
+| Method | Description |
+|--------|-------------|
+| **Sup-FT** | XLM-RoBERTa dual-encoder with bidirectional cross-attention over paragraph and per-technique explanations. Dynamic per-technique sigmoid thresholds. Trained with weighted binary cross-entropy. |
+| **Prompt-A** | Few-shot multi-agent detection via GPT-4o-mini (AutoGen framework). One expert agent per technique receives the technique definition, curated keywords, and example sentences extracted from training data. *Not* retrieval-augmented — definitions are fixed in the prompt at design time. |
+| **Iter-Ens** | Runs Prompt-A three times at temperature τ=0.4; predicts a technique if flagged in **at least one** of three rounds (union aggregation, per-round threshold 0.34). |
+| **NLI-ZS** | Zero-shot lower bound. mDeBERTa-v3-base-mnli-xnli frames each (paragraph, technique) pair as textual entailment. No training data required. |
+
+### Stage 2
+
+| Method | Description |
+|--------|-------------|
+| **S2-C** | mBERT (`bert-base-multilingual-cased`) BIO token classifier using hidden states from layer 10 (L10). Linear head + Dropout(0.1) → 47 output classes (O, 23 B-, 23 I-). Class weights 0.5 for O, 2.0 for B-/I-. Sliding window: max_length=256, stride=128. **Best overall.** |
+| **S2-A** | GPT-4o-mini LLM baseline — paragraph text only, no article context. |
+| **S2-B** | GPT-4o-mini with full source article as additional context. Negative result: +0.66 pp F1 over S2-A (95% CI includes zero), precision unchanged. |
+| **S2-A+** | S2-A augmented with few-shot character-level span exemplars from the CheckThat! 2024 training split. Improves over S2-A by +1.80 pp (EN) but remains >10 pp behind S2-C. |
+
+---
+
+## Data
+
+### Training data (Stage 1)
+
+| Language | Total | Native SemEval | Machine-translated | SlavicNLP seed |
+|----------|:-----:|:--------------:|:-----------------:|:--------------:|
+| English  |  446  |   446 (100%)   |         —         |       —        |
+| Polish   |  674  |   145  (21%)   |     514  (76%)    |    15  (2%)    |
+| Russian  |  684  |   143  (21%)   |     514  (75%)    |    27  (4%)    |
+
+Polish and Russian training sets were augmented by machine-translating SemEval articles from French (158), German (132), and Italian (227) using GPT-4o (517 articles, 514 retained after quality filtering).  
+Models are trained on the 25-label SlavicNLP 2025 superset for Slavic seed compatibility; all reported metrics are Macro F1 averaged over the **23 CheckThat! 2024 evaluation techniques**.
+
+### Training data (Stage 2 — character-level)
+
+| Language | Articles | Unique spans |
+|----------|:--------:|:------------:|
+| English  |   431    |    7,201     |
+| Polish   |   127    |    2,839     |
+| Russian  |   142    |    3,399     |
+
+> **Training data source:** S2-C is trained on the subset of CheckThat! 2024 Task 3 character-level span annotations that overlaps with the SemEval 2023 Task 3 training split. This intersection provides character-level supervision aligned with the same article pool used for Stage 1 training, and is disjoint from the evaluation set (which is drawn from the SemEval 2023 *development* split).
+
+> **Note on Polish training data:** The official CheckThat! 2024 merged label file for Polish contains a 16× duplication artifact (45,424 rows, 2,839 unique spans). This is documented in the paper (§3.2 footnote) as an official data release artifact. We verified that retraining on deduplicated data produces identical results.
+
+### Evaluation set
+
+The evaluation set is the intersection of the SemEval 2023 Task 3 development split and the CheckThat! 2024 Task 3 character-level annotations, providing a unified paragraph-level and character-level reference.
+
+| Language | Articles | Gold=0 articles | Paragraphs | Positive rate |
+|----------|:--------:|:---------------:|:----------:|:-------------:|
+| English  |    90    |        3        |   2,532    |     37.4%     |
+| Polish   |    49    |        4        |     730    |     62.1%     |
+| Russian  |    48    |        0        |     475    |     62.1%     |
+
+**No evaluation article appears in the Stage 2 training data.** The evaluation articles are drawn from the SemEval 2023 *development* split; Stage 2 trains on the SemEval 2023 *training* split (via CheckThat! 2024).
+
+Data must be obtained from the official SemEval 2023 Task 3 and CheckThat! 2024 Task 3 repositories. See [data access](#data-access) below.
+
+---
+
+## Results
+
+### Stage 1 — paragraph-level Macro F1 and Span Recall (SR_para)
+
+SR_para is the fraction of gold character-level spans whose containing paragraph is retrieved by Stage 1. It is a hard upper bound on end-to-end span recall, independent of Stage 2.
+
+| Method   | EN F1  | EN SR  | PL F1  | PL SR  | RU F1  | RU SR  |
+|----------|:------:|:------:|:------:|:------:|:------:|:------:|
+| NLI-ZS   |  5.54% |   —    | 10.80% |   —    | 10.62% |   —    |
+| Prompt-A | 38.47% | 27.54% | 49.97% | 45.79% | 35.25% | 41.95% |
+| Sup-FT   | 41.76% | 81.95% | 52.23% | 82.23% | 39.57% | 84.57% |
+| Iter-Ens | 44.88% | 51.69% | 50.55% | 90.66% | 38.77% | 85.39% |
+
+### Stage 2 — hidden layer ablation (EN only, Sup-FT filter)
+
+| Config | Backbone | Strategy      | Layer | Span F1 | Epoch |
+|--------|----------|---------------|:-----:|:-------:|:-----:|
+| A      | mBERT    | Single layer  |  12   | 23.83%  |  24   |
+| **B**  | **mBERT**| **Single layer** | **10** | **25.82%** | **13** |
+| C      | mBERT    | Single layer  |   8   | 24.61%  |  49   |
+| D      | mBERT    | Avg-pool all  |   —   | 23.53%  |  30   |
+| E      | mBERT    | Learned all   |   —   | 23.43%  |  25   |
+| A      | XLM-R    | Single layer  |  12   | 26.07%  | **5** ← unstable |
+| B      | XLM-R    | Single layer  |  10   | 25.67%  |  24   |
+
+XLM-R Config-A converges at epoch 5 (premature — training instability). Unified choice: **mBERT L10** (Config-B).
+
+### Stage 1 × Stage 2 cross-evaluation — span F1
+
+| Stage 1  | Stage 2       | EN     | PL     | RU     |
+|----------|---------------|:------:|:------:|:------:|
+| None     | S2-C (mBERT)  | 25.12% | 15.24% | 17.68% |
+| Sup-FT   | S2-A (LLM)    | 11.82% |  8.51% | 11.17% |
+| **Sup-FT**   | **S2-C (mBERT)** | **25.19%** | **15.28%** | **18.03%** |
+| Prompt-A | S2-A (LLM)    |  7.81% |  5.98% |  6.13% |
+| Prompt-A | S2-C (mBERT)  | 22.39% | 13.60% | 15.69% |
+| Iter-Ens | S2-A (LLM)    | 10.85% |  7.54% |  6.16% |
+| Iter-Ens | S2-C (mBERT)  | 24.08% | 14.65% | 17.87% |
+
+S2-C outperforms S2-A by **+13.37 pp (EN), +6.77 pp (PL), +6.86 pp (RU)** under the best pipeline (Sup-FT × S2-C).
+
+### LLM prompt engineering vs. supervision (EN, Sup-FT filter)
+
+| Stage 2 localizer                  | EN Span F1        |
+|------------------------------------|:-----------------:|
+| S2-A (LLM, no exemplars)           | 12.87% ± 0.22%    |
+| S2-A+ (LLM, few-shot span exemplars) | 14.68% ± 0.26% |
+| **S2-C (supervised mBERT L10)**    | **25.19%**        |
+
+S2-A+ closes only ~15% of the gap to S2-C. The supervised advantage is a property of the supervision regime, not prompt formulation.
+
+### Six-way error decoupling (Sup-FT × S2-C)
+
+| Lang | S1-FP-Para | S1-FP-Tech | S2-FP | S1 FP% | S1-FN-Para | S1-FN-Tech | S2-FN | S2 FN% |
+|------|:----------:|:----------:|:-----:|:------:|:----------:|:----------:|:-----:|:------:|
+| EN   |   1,498    |    1,630   |  480  |  86.7% |    332     |    553     |  675  |  43.3% |
+| PL   |     383    |    1,318   |  127  |  93.1% |    372     |    556     |  930  |  50.1% |
+| RU   |     235    |      775   |  204  |  83.2% |    122     |    184     |  387  |  55.8% |
+
+- **83–93% of false positives originate from Stage 1** (primarily technique mis-attribution, not paragraph-level errors).
+- **False negatives shift toward Stage 2 as training resources decrease**: EN 43.3% → PL 50.1% → RU 55.8%.
+
+---
+
+## Setup
+
+### Requirements
+
+```bash
+pip install torch transformers pytorch-lightning scikit-learn pandas numpy tqdm boto3 pyautogen openai
+```
+
+Tested with Python 3.10, PyTorch 2.1, Transformers 4.38.
+
+### Configuration
+
+Each notebook contains a **CONFIGURATION cell** near the top (cell 2). Update the paths and credentials before running:
+
+```python
+# Root directory of this repository
+BASE = "your/path/here"
+
+# SemEval-2023 / CheckThat!-2024 data directories
+SEMEVAL_DEV_DIR  = "your/path/here"
+CHECKTHAT24_DIR  = "your/path/here"
+
+# S3 credentials (if using remote model storage)
+os.environ.setdefault("AWS_ACCESS_KEY_ID",     "your-access-key-id")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "your-secret-access-key")
+S3_ENDPOINT = "https://your-s3-endpoint"
+S3_BUCKET   = "your-s3-bucket"
+```
+
+For Prompt-A and Iter-Ens, set your OpenAI API key:
+
+```bash
+export OPENAI_API_KEY="your-key-here"
+```
+
+### Data access
+
+All datasets used in this work originate from official shared task challenges. Data must be requested or downloaded through the respective challenge platforms and is subject to each organizer's terms of use — it is not redistributed here.
+
+| Resource | Challenge / URL |
+|----------|-----------------|
+| SemEval 2023 Task 3 | https://propaganda.math.unipd.it/semeval2023task3/ |
+| CheckThat! 2024 Task 3 | https://checkthat.gitlab.io/clef2024/task3/ |
+| SlavicNLP 2025 | https://bsnlp.cs.helsinki.fi/slavicnlp2025.html |
+
+---
+
+## Running the Experiments
+
+Run notebooks in order within each stage. Stage 2 depends on Stage 1 predictions.
+
+**Stage 1:**
+```
+stage1_step1  →  stage1_step2  →  stage1_step3 (SR_para)
+stage1_step4 (NLI baseline, independent)
+stage1_step5 (Prompt-A / Iter-Ens, independent)
+stage1_step6 (TCM analysis, after step2 and step5)
+```
+
+**Stage 2:**
+```
+stage2_step1  →  stage2_step2  →  stage2_step3  →  stage2_step4
+                                       ↑
+                              requires Stage 1 predictions
+                              (from stage1_step2 and stage1_step5)
+```
+
+**Evaluation:**
+```
+evaluation/evaluation_span_f1_scorer.ipynb   # standalone, works with any prediction TSV
+```
+
+---
+
+## S2-C Training Configuration
+
+| Hyperparameter | Value |
+|----------------|-------|
+| Backbone | `bert-base-multilingual-cased` (mBERT) |
+| Feature layer | L10 (hidden state from layer 10) |
+| Output classes | 47 (O + 23 B- + 23 I-) |
+| Class weights | O: 0.5 / B- and I-: 2.0 |
+| Optimizer | AdamW |
+| Learning rate | 6.91 × 10⁻⁵ |
+| Weight decay | 3.58 × 10⁻³ |
+| Warmup steps | 226 |
+| Batch size | 32 |
+| Max epochs | 30 |
+| Precision | FP16 mixed |
+| Sliding window | max_length=256, stride=128 |
+| Best checkpoint | Selected by EN span F1 on dev set (optimal epoch: 13) |
+| Random seed | 42 |
+
+---
+
